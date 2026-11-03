@@ -40,6 +40,7 @@ from nat.plugins.langchain.agent.base import _chunk_to_message
 from nat.plugins.langchain.agent.base import _incomplete_tool_call_args
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraph
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraphState
+from nat.plugins.langchain.agent.tool_calling_agent.agent import _truncation_reason
 from nat.plugins.langchain.agent.tool_calling_agent.agent import create_tool_calling_agent_prompt
 from nat.plugins.langchain.agent.tool_calling_agent.register import ToolCallAgentWorkflowConfig
 from nat.plugins.langchain.agent.tool_calling_agent.register import TruncationRetryConfig
@@ -565,10 +566,7 @@ async def test_validate_truncation_delegates_to_retry(error_mock_llm, mock_tool)
 
 def _cut_off_chunk(raw_args: str = '{"path": "report.txt", "content": "line 01') -> AIMessageChunk:
     """The reply ``_stream_llm`` accumulates when the stream ends in the middle of the arguments."""
-    return AIMessageChunk(content="",
-                          tool_call_chunks=[{
-                              "name": "T", "args": raw_args, "id": "call_1", "index": 0
-                          }])
+    return AIMessageChunk(content="", tool_call_chunks=[{"name": "T", "args": raw_args, "id": "call_1", "index": 0}])
 
 
 def test_chunk_to_message_records_cut_off_arguments():
@@ -626,14 +624,14 @@ async def test_validate_complete_tool_call_without_finish_reason_passes(error_mo
 
 
 async def test_validate_raises_when_the_truncation_retry_is_cut_off_again(error_mock_llm, mock_tool):
-    """empty/first reply → retry → still cut off: the second reply must not reach the tools either."""
+    """A retry that is cut off again must not reach the tools: the retry budget ends in the same error."""
     agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1)
     truncated = AIMessage(content="partial", response_metadata={"finish_reason": "length"})
     still_cut_off = _chunk_to_message(_cut_off_chunk())
     state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
 
-    with patch.object(agent, "_retry_on_truncation", new_callable=AsyncMock, return_value=still_cut_off):
-        with pytest.raises(RuntimeError, match="tool call arguments are not complete JSON"):
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_cut_off):
+        with pytest.raises(RuntimeError, match="LLM output still truncated after 1 retries"):
             await agent._validate_llm_response(truncated, state)
 
 
@@ -845,13 +843,91 @@ async def test_retry_on_empty_succeeds(error_mock_llm, mock_tool):
     assert result.content == "actual answer"
 
 
-async def test_retry_on_empty_exhausted(error_mock_llm, mock_tool):
-    """All empty-response retries exhausted raises RuntimeError."""
-    agent = _make_agent(error_mock_llm, mock_tool, max_empty_response_retries=2)
+async def test_retry_on_empty_returns_a_cut_off_reply(error_mock_llm, mock_tool):
+    """A retry that comes back cut off is returned, not discarded as another empty reply."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_empty_response_retries=3)
     first_meta: dict = {"finish_reason": "stop"}
+    cut_off = _chunk_to_message(_cut_off_chunk())
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=cut_off) as mock_invoke:
+        result = await agent._retry_on_empty_response(state, first_meta)
+
+    assert result is cut_off
+    # The first retry is enough: the reply is not retried until the budget is gone.
+    mock_invoke.assert_awaited_once()
+    assert "tool call arguments are not complete JSON" in (_truncation_reason(result) or "")
+
+
+async def test_empty_replies_exhaust_the_configured_budget(error_mock_llm, mock_tool):
+    """The caller owns the empty-response budget: N configured retries allow exactly N extra requests."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_empty_response_retries=2)
     still_empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
     state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
 
-    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_empty):
-        with pytest.raises(RuntimeError, match="empty responses after 2 retries"):
-            await agent._retry_on_empty_response(state, first_meta)
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_empty) as mock_invoke:
+        with pytest.raises(RuntimeError, match="empty response"):
+            await agent._validate_llm_response(still_empty, state)
+
+    assert mock_invoke.await_count == 2
+
+
+async def test_empty_reply_after_a_truncation_retry_uses_the_empty_budget(error_mock_llm, mock_tool):
+    """A truncation retry that comes back empty is retried again, not raised on the spot."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1, max_empty_response_retries=1)
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    good = AIMessage(content="final answer", response_metadata={"finish_reason": "stop"})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, side_effect=[empty, good]) as mock_invoke:
+        result = await agent._validate_llm_response(truncated, state)
+
+    assert result.content == "final answer"
+    assert mock_invoke.await_count == 2
+
+
+async def test_truncation_retry_that_stays_empty_stops_at_the_configured_budget(error_mock_llm, mock_tool):
+    """Each dead end spends its own budget once; the error comes after both are spent."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1, max_empty_response_retries=1)
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=empty) as mock_invoke:
+        with pytest.raises(RuntimeError, match="empty response"):
+            await agent._validate_llm_response(truncated, state)
+
+    assert mock_invoke.await_count == 2
+
+
+async def test_no_empty_budget_raises_as_soon_as_the_truncation_retry_is_empty(error_mock_llm, mock_tool):
+    """With max_empty_response_retries=0 the behaviour is unchanged: no second retry is attempted."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1, max_empty_response_retries=0)
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=empty) as mock_invoke:
+        with pytest.raises(RuntimeError, match="empty response"):
+            await agent._validate_llm_response(truncated, state)
+
+    assert mock_invoke.await_count == 1
+
+
+async def test_alternating_empty_and_truncated_replies_stop(error_mock_llm, mock_tool):
+    """Empty and truncated replies alternate: the budgets are consumed, never reset, so it terminates."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=2, max_empty_response_retries=2)
+    truncated = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent,
+                      "_invoke_llm",
+                      new_callable=AsyncMock,
+                      side_effect=[empty, truncated, empty, truncated, empty, truncated]) as mock_invoke:
+        with pytest.raises(RuntimeError):
+            await agent._validate_llm_response(truncated, state)
+
+    # 1 + max_truncation_retries + max_empty_response_retries is the hard ceiling.
+    assert mock_invoke.await_count <= 1 + 2 + 2

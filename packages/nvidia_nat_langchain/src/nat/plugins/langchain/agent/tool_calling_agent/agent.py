@@ -36,8 +36,8 @@ from pydantic import Field
 from nat.llm.utils.constants import LLMFinishReason
 from nat.plugins.langchain.agent.base import AGENT_CALL_LOG_MESSAGE
 from nat.plugins.langchain.agent.base import AGENT_LOG_PREFIX
-from nat.plugins.langchain.agent.base import AgentDecision
 from nat.plugins.langchain.agent.base import TRUNCATED_TOOL_CALL_ARGS
+from nat.plugins.langchain.agent.base import AgentDecision
 from nat.plugins.langchain.agent.base import _chunk_to_message
 from nat.plugins.langchain.agent.base import _format_agent_thoughts_for_log
 from nat.plugins.langchain.agent.dual_node import DualNodeAgent
@@ -70,6 +70,22 @@ def _truncation_reason(response: BaseMessage) -> str | None:
         details = metadata.get("incomplete_details") or {}
         return f"status='incomplete', reason='{details.get('reason')}'"
     return None
+
+
+def _is_empty_reply(response: BaseMessage) -> bool:
+    """True when a reply carries no content, no tool calls and no unparsable tool calls."""
+    return (not response.tool_calls and not getattr(response, "invalid_tool_calls", None)
+            and not (response.content and str(response.content).strip()))
+
+
+def _empty_response_error(metadata: dict) -> RuntimeError:
+    """Build the error raised when a reply has nothing usable in it.
+
+    Used both when the empty-response retries are exhausted and when a truncation retry comes back empty, so the
+    two dead ends read the same to a caller.
+    """
+    return RuntimeError(f"LLM returned an empty response (no content, no tool calls). "
+                        f"finish_reason={metadata.get('finish_reason')}, response_metadata={metadata}")
 
 
 class ToolCallAgentGraph(DualNodeAgent):
@@ -177,8 +193,13 @@ class ToolCallAgentGraph(DualNodeAgent):
             logger.error("%s Failed to call agent_node: %s", AGENT_LOG_PREFIX, ex)
             raise
 
-    def _raise_truncated(self, response: AIMessage, metadata: dict, truncation: str) -> typing.NoReturn:
-        """Raise the error that explains why a cut-off reply is not handed to the tools."""
+    async def _handle_truncation(self, response: AIMessage, state: ToolCallAgentGraphState,
+                                 truncation: str) -> AIMessage:
+        """Retry a truncated reply when configured, otherwise raise with token accounting."""
+        if self._max_truncation_retries > 0:
+            return await self._retry_on_truncation(response, state)
+
+        metadata: dict = getattr(response, "response_metadata", {})
         usage: UsageMetadata = self._get_token_usage(response)
         truncated_content: str = str(response.content)[:500] if response.content else "<empty>"
         model_name: str = metadata.get("model_name", "unknown")
@@ -224,32 +245,29 @@ class ToolCallAgentGraph(DualNodeAgent):
         Returns:
             A validated (possibly retried) response.
         """
-        metadata: dict = getattr(response, "response_metadata", {})
+        first_metadata: dict = getattr(response, "response_metadata", {}) or {}
+        empty_retries_left: int = self._max_empty_response_retries
+
+        # One loop for both dead ends: a truncated reply is retried, and if that retry comes back empty it
+        # continues into the empty-response recovery (and the other way round). Both budgets are consumed here
+        # and never reset, so a reply that alternates between empty and truncated stops after at most
+        # 1 + max_truncation_retries + max_empty_response_retries requests instead of looping.
+        while True:
+            metadata: dict = getattr(response, "response_metadata", {}) or first_metadata
+            truncation: str | None = _truncation_reason(response)
+            # Output truncated — can cause GraphRecursionError loop if unhandled, and a cut-off
+            # tool call must not be executed with partially parsed arguments.
+            if truncation is not None:
+                response = await self._handle_truncation(response, state, truncation)
+                continue
+            if not _is_empty_reply(response):
+                break
+            if empty_retries_left <= 0:
+                raise _empty_response_error(metadata)
+            empty_retries_left -= 1
+            response = await self._retry_on_empty_response(state, metadata)
+
         finish_reason: str | None = metadata.get("finish_reason")
-
-        # Output truncated — can cause GraphRecursionError loop if unhandled
-        truncation: str | None = _truncation_reason(response)
-        if truncation is not None:
-            if self._max_truncation_retries > 0:
-                response = await self._retry_on_truncation(response, state)
-                # A retry can come back cut off as well; the loop has to end here rather than run the tool.
-                truncation = _truncation_reason(response)
-                if truncation is None:
-                    metadata = getattr(response, "response_metadata", {})
-                    finish_reason = metadata.get("finish_reason")
-                else:
-                    self._raise_truncated(response, metadata, truncation)
-            else:
-                self._raise_truncated(response, metadata, truncation)
-
-        # Empty response — no content, no tool calls at all
-        if (not response.tool_calls and not getattr(response, "invalid_tool_calls", None)
-                and not (response.content and str(response.content).strip())):
-            if self._max_empty_response_retries > 0:
-                response = await self._retry_on_empty_response(state, metadata)
-            else:
-                raise RuntimeError(f"LLM returned an empty response (no content, no tool calls). "
-                                   f"finish_reason={finish_reason}, response_metadata={metadata}")
 
         # Invalid tool calls — LLM produced tool call JSON that could not be parsed
         if not response.tool_calls and getattr(response, "invalid_tool_calls", None):
@@ -338,42 +356,25 @@ class ToolCallAgentGraph(DualNodeAgent):
                            f"total_tokens={usage.get('total_tokens', 'N/A')}")
 
     async def _retry_on_empty_response(self, state: ToolCallAgentGraphState, first_metadata: dict) -> AIMessage:
-        """Retry the LLM call when it returns an empty response.
+        """Make one more LLM call after an empty reply and return whatever it produces.
 
-        Args:
-            state: Current agent graph state.
-            first_metadata: The response_metadata from the empty response.
-
-        Returns:
-            The response from the successful retry.
-
-        Raises:
-            RuntimeError: If all retries are exhausted without a non-empty response.
+        The caller owns the budget: it decides how many empty replies to absorb, which keeps a truncation
+        retry that comes back empty and an empty reply that comes back truncated on the same counter instead
+        of letting each path retry on its own.
         """
-        response: AIMessage | None = None
-        for attempt in range(1, self._max_empty_response_retries + 1):
-            logger.warning(
-                "%s LLM returned an empty response. Retry %d/%d. response_metadata=%s",
-                AGENT_LOG_PREFIX,
-                attempt,
-                self._max_empty_response_retries,
-                first_metadata,
-            )
-            response = await self._invoke_llm(state)
+        logger.warning(
+            "%s LLM returned an empty response; retrying. response_metadata=%s",
+            AGENT_LOG_PREFIX,
+            first_metadata,
+        )
+        response = await self._invoke_llm(state)
 
-            has_content: bool = bool(response.content and str(response.content).strip())
-            if response.tool_calls or has_content:
-                logger.info(
-                    "%s Empty response retry succeeded on attempt %d",
-                    AGENT_LOG_PREFIX,
-                    attempt,
-                )
-                return response
-
-            first_metadata = getattr(response, "response_metadata", {})
-
-        raise RuntimeError(f"LLM still returning empty responses after {self._max_empty_response_retries} retries. "
-                           f"response_metadata={first_metadata}")
+        # ``_invoke_llm`` returns the accumulated stream. Convert it before anything reads it:
+        # ``_truncation_reason`` reads the argument verdict that ``_chunk_to_message`` records, and a
+        # chunk that was never converted does not carry it, so the check would silently do nothing here.
+        if isinstance(response, AIMessageChunk):
+            response = _chunk_to_message(response)
+        return response
 
     async def conditional_edge(self, state: ToolCallAgentGraphState):
         try:
