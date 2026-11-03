@@ -42,6 +42,7 @@ from nat.plugins.langchain.agent.base import AGENT_LOG_PREFIX
 from nat.plugins.langchain.agent.base import INPUT_SCHEMA_MESSAGE
 from nat.plugins.langchain.agent.base import NO_INPUT_ERROR_MESSAGE
 from nat.plugins.langchain.agent.base import TOOL_NOT_FOUND_ERROR_MESSAGE
+from nat.plugins.langchain.agent.base import TRUNCATED_TOOL_CALL_ARGS
 from nat.plugins.langchain.agent.base import AgentDecision
 from nat.plugins.langchain.agent.base import _extract_message_text
 from nat.plugins.langchain.agent.base import _format_agent_thoughts_for_log
@@ -65,6 +66,25 @@ class ReActGraphState(BaseModel):
     agent_scratchpad: list[AgentAction] = Field(default_factory=list)  # agent thoughts / intermediate steps
     tool_responses: list[BaseMessage] = Field(default_factory=list)  # the responses from any tool calls
     final_answer: str | None = Field(default=None)  # the final answer from the ReAct Agent
+
+
+def _truncation_reason(response: BaseMessage) -> str | None:
+    """Why this reply's tool calls cannot be trusted, or ``None`` when there is nothing to object to.
+
+    The argument verdict comes first: it is the only signal that does not need the provider to cooperate. Explicit
+    markers (``finish_reason`` "length", Responses ``status`` "incomplete") are also honored, and a missing or unknown
+    ``finish_reason`` is not treated as truncation.
+    """
+    metadata: dict = getattr(response, "response_metadata", {}) or {}
+    incomplete = metadata.get(TRUNCATED_TOOL_CALL_ARGS)
+    if incomplete:
+        return f"tool call arguments are not complete JSON ({', '.join(incomplete)})"
+    if metadata.get("finish_reason") == "length":
+        return "finish_reason='length'"
+    if metadata.get("status") == "incomplete":
+        details = metadata.get("incomplete_details") or {}
+        return f"status='incomplete' (reason={details.get('reason', 'unknown')})"
+    return None
 
 
 class ReActAgentGraph(DualNodeAgent):
@@ -260,6 +280,14 @@ class ReActAgentGraph(DualNodeAgent):
                 try:
                     # check if the agent has the final answer yet
                     logger.debug("%s Successfully obtained agent response. Parsing agent's response", AGENT_LOG_PREFIX)
+
+                    # A reply whose streamed tool-call arguments were cut off parses leniently into a call that
+                    # looks complete, and a reply that stopped mid-output can still look like a finished answer.
+                    # The arguments are the only signal that does not need the provider to cooperate.
+                    truncation: str | None = _truncation_reason(output_message)
+                    if truncation is not None:
+                        raise RuntimeError(f"LLM output truncated ({truncation}). "
+                                           f"Truncated output: {str(output_message.content)[:500]!r}")
 
                     # Check for native tool calls first (when use_native_tool_calling is enabled)
                     if self.use_native_tool_calling and hasattr(output_message,
