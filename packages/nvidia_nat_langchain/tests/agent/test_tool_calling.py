@@ -1042,7 +1042,7 @@ async def test_tool_calling_agent_returns_a_string_for_a_chat_request():
     assert response == "all done"
 
 
-class _ChunkStream:
+class _StreamedAgentStub:
     """Stands in for the agent runnable: ``astream`` yields the given chunks."""
 
     def __init__(self, chunks):
@@ -1080,7 +1080,7 @@ def _streamed_tool_call_chunks() -> list[AIMessageChunk]:
 async def test_invoke_llm_returns_message_with_wire_tool_calls(error_mock_llm, mock_tool):
     """Merged stream chunks come back as an AIMessage with ``additional_kwargs["tool_calls"]`` restored."""
     agent = _make_agent(error_mock_llm, mock_tool)
-    agent.agent = _ChunkStream(_streamed_tool_call_chunks())
+    agent.agent = _StreamedAgentStub(_streamed_tool_call_chunks())
 
     result = await agent._invoke_llm(ToolCallAgentGraphState(messages=[HumanMessage(content="test")]))
 
@@ -1093,7 +1093,7 @@ async def test_retry_on_truncation_returns_message_not_chunk(error_mock_llm, moc
     """A successful truncation retry returns the same message type as the first call, not a bare chunk."""
     agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1, truncation_scaling_fn=lambda c: c + 512)
     agent.agent = _PromptStub(None)
-    agent.agent.first = _PromptStub(_ChunkStream(_streamed_tool_call_chunks()))
+    agent.agent.first = _PromptStub(_StreamedAgentStub(_streamed_tool_call_chunks()))
     first_response = AIMessage(content="partial",
                                response_metadata={"finish_reason": "length"},
                                usage_metadata={
