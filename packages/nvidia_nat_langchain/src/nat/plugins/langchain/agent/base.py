@@ -79,6 +79,31 @@ def _format_agent_thoughts_for_log(message: BaseMessage) -> str:
     return _extract_reasoning_content(message)
 
 
+TRUNCATED_TOOL_CALL_ARGS = "nat_truncated_tool_call_args"
+
+
+def _incomplete_tool_call_args(chunk: BaseMessage) -> list[str]:
+    """Names of the tool calls whose raw streamed arguments are not complete JSON.
+
+    LangChain parses a cut-off argument string with ``parse_partial_json`` and files the result under
+    ``tool_calls``, so once a chunk is converted the cut is invisible. Judging the raw string is the only
+    provider-independent signal: a server is free to omit ``finish_reason``, while complete arguments always parse.
+    An empty string is a legitimate zero-argument call; arguments that are not strings (already parsed) are skipped.
+    """
+    incomplete: list[str] = []
+    for call in getattr(chunk, "tool_call_chunks", None) or []:
+        raw = call.get("args")
+        if not isinstance(raw, str):
+            continue
+        if raw.strip() in ("", "{}"):
+            continue
+        try:
+            json.loads(raw)
+        except ValueError:
+            incomplete.append(call.get("name") or "<unnamed>")
+    return incomplete
+
+
 def _chunk_to_message(chunk: AIMessageChunk) -> AIMessage:
     """Convert an accumulated AIMessageChunk into an AIMessage, preserving tool_calls.
 
@@ -93,13 +118,18 @@ def _chunk_to_message(chunk: AIMessageChunk) -> AIMessage:
         if "tool_calls" in openai_msg:
             additional_kwargs["tool_calls"] = openai_msg["tool_calls"]
 
-    return AIMessage(
+    message = AIMessage(
         content=chunk.content,
         additional_kwargs=additional_kwargs,
         response_metadata=chunk.response_metadata,
         id=chunk.id,
         usage_metadata=chunk.usage_metadata,
     )
+    # Recorded, not raised: the conversion stays a conversion, and the agents read the verdict from the metadata.
+    incomplete = _incomplete_tool_call_args(chunk)
+    if incomplete:
+        message.response_metadata = {**message.response_metadata, TRUNCATED_TOOL_CALL_ARGS: incomplete}
+    return message
 
 
 TOOL_NOT_FOUND_ERROR_MESSAGE = "There is no tool named {tool_name}. Tool must be one of {tools}."

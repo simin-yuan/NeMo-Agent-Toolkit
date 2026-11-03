@@ -18,6 +18,7 @@ from langchain_core.agents import AgentAction
 from langchain_core.agents import AgentFinish
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessageChunk
 from langchain_core.messages import HumanMessage
 from langchain_core.messages.tool import ToolMessage
 from langchain_core.outputs import ChatGeneration
@@ -25,6 +26,7 @@ from langchain_core.outputs import ChatResult
 from langgraph.graph.state import CompiledStateGraph
 
 from nat.plugins.langchain.agent.base import AgentDecision
+from nat.plugins.langchain.agent.base import _chunk_to_message
 from nat.plugins.langchain.agent.react_agent.agent import NO_INPUT_ERROR_MESSAGE
 from nat.plugins.langchain.agent.react_agent.agent import TOOL_NOT_FOUND_ERROR_MESSAGE
 from nat.plugins.langchain.agent.react_agent.agent import ReActAgentGraph
@@ -1819,3 +1821,64 @@ def test_build_lc_config_ignores_unknown_model_sentinel():
     # a genuine per-request model is still forwarded as an override
     lc_config = _build_lc_config(5, "nvidia/nemotron-3.5-lightning-30b-a3b")
     assert lc_config["configurable"] == {"model_name": "nvidia/nemotron-3.5-lightning-30b-a3b"}
+
+
+def _streamed_tool_call(*, args: str, finish_reason: str | None = None) -> AIMessage:
+    """The message the ReAct agent sees when a reply streams one native tool call."""
+    chunk = AIMessageChunk(
+        content="",
+        tool_call_chunks=[{
+            "name": "Tool A", "args": args, "id": "call_1", "index": 0
+        }],
+        response_metadata={} if finish_reason is None else {"finish_reason": finish_reason},
+    )
+    return _chunk_to_message(chunk)
+
+
+def _use_streamed_reply(monkeypatch, agent: ReActAgentGraph, message: AIMessage) -> None:
+
+    async def _reply(*args, **kwargs):  # noqa: ARG001
+        return message
+
+    monkeypatch.setattr(agent, "_stream_llm", _reply)
+    agent.use_native_tool_calling = True
+
+
+async def test_agent_node_refuses_a_cut_off_native_tool_call(mock_react_agent, monkeypatch):
+    """Arguments cut mid-string must not reach the tool: the lenient parser makes the call look complete."""
+    _use_streamed_reply(monkeypatch,
+                        mock_react_agent,
+                        _streamed_tool_call(args='{"tool_input": "report.txt", "content": "line 01'))
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        await mock_react_agent.agent_node(ReActGraphState(messages=[HumanMessage('hi')]))
+
+
+async def test_agent_node_refuses_on_finish_reason_length(mock_react_agent, monkeypatch):
+    """An explicit length marker is still honoured even when the arguments happen to parse."""
+    _use_streamed_reply(monkeypatch,
+                        mock_react_agent,
+                        _streamed_tool_call(args='{"tool_input": "report.txt"}', finish_reason="length"))
+
+    with pytest.raises(RuntimeError, match="truncated"):
+        await mock_react_agent.agent_node(ReActGraphState(messages=[HumanMessage('hi')]))
+
+
+async def test_agent_node_runs_a_complete_native_tool_call(mock_react_agent, monkeypatch):
+    _use_streamed_reply(monkeypatch, mock_react_agent, _streamed_tool_call(args='{"tool_input": "report.txt"}'))
+
+    state = await mock_react_agent.agent_node(ReActGraphState(messages=[HumanMessage('hi')]))
+
+    assert len(state.agent_scratchpad) == 1
+    assert state.agent_scratchpad[0].tool == "Tool A"
+
+
+async def test_agent_node_runs_a_complete_call_without_finish_reason(mock_react_agent, monkeypatch):
+    """A server that never sets finish_reason must not have its complete calls refused."""
+    _use_streamed_reply(monkeypatch,
+                        mock_react_agent,
+                        _streamed_tool_call(args='{"tool_input": "report.txt", "content": "line\\n2"}'))
+
+    state = await mock_react_agent.agent_node(ReActGraphState(messages=[HumanMessage('hi')]))
+
+    assert len(state.agent_scratchpad) == 1
