@@ -1909,10 +1909,7 @@ async def test_agent_node_raises_when_stream_ends_mid_native_tool_call(mock_reac
             AIMessageChunk(content="", response_metadata={"model_provider": "openai"}),
             AIMessageChunk(content="",
                            tool_call_chunks=[{
-                               "name": "Tool A",
-                               "args": '{"query": "Lang',
-                               "id": "call_1",
-                               "index": 0
+                               "name": "Tool A", "args": '{"query": "Lang', "id": "call_1", "index": 0
                            }]),
         ]))
     state = ReActGraphState(messages=[HumanMessage(content="hi")])
@@ -1921,4 +1918,3 @@ async def test_agent_node_raises_when_stream_ends_mid_native_tool_call(mock_reac
         await mock_react_agent_no_raise.agent_node(state)
 
     assert state.agent_scratchpad == []
-
