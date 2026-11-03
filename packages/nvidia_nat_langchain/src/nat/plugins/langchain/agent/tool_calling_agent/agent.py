@@ -158,8 +158,12 @@ class ToolCallAgentGraph(DualNodeAgent):
 
         logger.debug("%s Initialized Tool Calling Agent Graph", AGENT_LOG_PREFIX)
 
-    async def _invoke_llm(self, state: ToolCallAgentGraphState):
-        """Stream the LLM and return the accumulated AIMessage response.
+    async def _invoke_llm(self, state: ToolCallAgentGraphState) -> AIMessage:
+        """Stream the LLM and return the accumulated response as an ``AIMessage``.
+
+        The streamed chunks are merged and converted with ``_chunk_to_message``, which restores the OpenAI wire
+        format (``additional_kwargs["tool_calls"]``). Every caller (the first call and both retry paths) therefore
+        gets the same message type.
 
         Args:
             state: Current agent graph state containing the conversation messages.
@@ -180,7 +184,7 @@ class ToolCallAgentGraph(DualNodeAgent):
         response: AIMessageChunk = chunks[0]
         for c in chunks[1:]:
             response = response + c
-        return response
+        return _chunk_to_message(response)
 
     async def agent_node(self, state: ToolCallAgentGraphState, config: RunnableConfig | None = None):
         try:
@@ -189,10 +193,6 @@ class ToolCallAgentGraph(DualNodeAgent):
                 raise RuntimeError('No input received in state: "messages"')
 
             response = await self._invoke_llm(state)
-
-            if isinstance(response, AIMessageChunk):
-                response = _chunk_to_message(response)
-
             response = await self._validate_llm_response(response, state)
 
             if self.detailed_logs:

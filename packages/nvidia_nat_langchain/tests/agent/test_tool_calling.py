@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessageChunk
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import ToolMessage
 from langgraph.graph.state import CompiledStateGraph
@@ -1039,3 +1040,68 @@ async def test_tool_calling_agent_returns_a_string_for_a_chat_request():
     async with tool_calling_agent_workflow(config, builder) as function_info:
         response = await function_info.single_fn(request)
     assert response == "all done"
+
+
+class _ChunkStream:
+    """Stands in for the agent runnable: ``astream`` yields the given chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    async def astream(self, *_args, **_kwargs):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _PromptStub:
+    """Stands in for ``agent.first``: ``first | bound_llm`` returns the chunk stream."""
+
+    def __init__(self, runnable):
+        self._runnable = runnable
+
+    def __or__(self, _other):
+        return self._runnable
+
+
+def _streamed_tool_call_chunks() -> list[AIMessageChunk]:
+    return [
+        AIMessageChunk(content="",
+                       tool_call_chunks=[{
+                           "name": "T", "args": '{"query": ', "id": "call_1", "index": 0, "type": "tool_call_chunk"
+                       }]),
+        AIMessageChunk(content="",
+                       tool_call_chunks=[{
+                           "name": None, "args": '"x"}', "id": None, "index": 0, "type": "tool_call_chunk"
+                       }],
+                       response_metadata={"finish_reason": "tool_calls"}),
+    ]
+
+
+async def test_invoke_llm_returns_message_with_wire_tool_calls(error_mock_llm, mock_tool):
+    """Merged stream chunks come back as an AIMessage with ``additional_kwargs["tool_calls"]`` restored."""
+    agent = _make_agent(error_mock_llm, mock_tool)
+    agent.agent = _ChunkStream(_streamed_tool_call_chunks())
+
+    result = await agent._invoke_llm(ToolCallAgentGraphState(messages=[HumanMessage(content="test")]))
+
+    assert type(result) is AIMessage
+    assert result.tool_calls[0]["args"] == {"query": "x"}
+    assert result.additional_kwargs["tool_calls"][0]["function"]["name"] == "T"
+
+
+async def test_retry_on_truncation_returns_message_not_chunk(error_mock_llm, mock_tool):
+    """A successful truncation retry returns the same message type as the first call, not a bare chunk."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1, truncation_scaling_fn=lambda c: c + 512)
+    agent.agent = _PromptStub(None)
+    agent.agent.first = _PromptStub(_ChunkStream(_streamed_tool_call_chunks()))
+    first_response = AIMessage(content="partial",
+                               response_metadata={"finish_reason": "length"},
+                               usage_metadata={
+                                   "output_tokens": 100, "input_tokens": 50, "total_tokens": 150
+                               })
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    result = await agent._retry_on_truncation(first_response, state)
+
+    assert type(result) is AIMessage
+    assert result.additional_kwargs["tool_calls"][0]["function"]["name"] == "T"
