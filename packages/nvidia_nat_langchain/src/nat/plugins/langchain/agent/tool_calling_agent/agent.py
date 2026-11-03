@@ -37,6 +37,7 @@ from nat.llm.utils.constants import LLMFinishReason
 from nat.plugins.langchain.agent.base import AGENT_CALL_LOG_MESSAGE
 from nat.plugins.langchain.agent.base import AGENT_LOG_PREFIX
 from nat.plugins.langchain.agent.base import AgentDecision
+from nat.plugins.langchain.agent.base import TRUNCATED_TOOL_CALL_ARGS
 from nat.plugins.langchain.agent.base import _chunk_to_message
 from nat.plugins.langchain.agent.base import _format_agent_thoughts_for_log
 from nat.plugins.langchain.agent.dual_node import DualNodeAgent
@@ -50,6 +51,25 @@ logger = logging.getLogger(__name__)
 class ToolCallAgentGraphState(BaseModel):
     """State schema for the Tool Calling Agent Graph"""
     messages: list[BaseMessage] = Field(default_factory=list)  # input and output of the Agent
+
+
+def _truncation_reason(response: BaseMessage) -> str | None:
+    """Why this reply's tool calls cannot be trusted, or ``None`` when there is nothing to object to.
+
+    The argument verdict comes first: it is the only signal that does not need the provider to cooperate. Explicit
+    markers (``finish_reason`` "length", Responses ``status`` "incomplete") are still honored when present, and a
+    missing or unknown ``finish_reason`` is not treated as truncation.
+    """
+    metadata: dict = getattr(response, "response_metadata", {}) or {}
+    incomplete = metadata.get(TRUNCATED_TOOL_CALL_ARGS)
+    if incomplete:
+        return f"tool call arguments are not complete JSON ({', '.join(incomplete)})"
+    if metadata.get("finish_reason") == LLMFinishReason.LENGTH:
+        return "finish_reason='length'"
+    if metadata.get("status") == "incomplete":
+        details = metadata.get("incomplete_details") or {}
+        return f"status='incomplete', reason='{details.get('reason')}'"
+    return None
 
 
 class ToolCallAgentGraph(DualNodeAgent):
@@ -157,6 +177,19 @@ class ToolCallAgentGraph(DualNodeAgent):
             logger.error("%s Failed to call agent_node: %s", AGENT_LOG_PREFIX, ex)
             raise
 
+    def _raise_truncated(self, response: AIMessage, metadata: dict, truncation: str) -> typing.NoReturn:
+        """Raise the error that explains why a cut-off reply is not handed to the tools."""
+        usage: UsageMetadata = self._get_token_usage(response)
+        truncated_content: str = str(response.content)[:500] if response.content else "<empty>"
+        model_name: str = metadata.get("model_name", "unknown")
+        msg: str = (f"LLM output truncated ({truncation}). "
+                    f"model={model_name}, "
+                    f"output_tokens={usage['output_tokens']}, "
+                    f"input_tokens={usage['input_tokens']}, "
+                    f"total_tokens={usage['total_tokens']}. "
+                    f"Truncated output: {truncated_content!r}")
+        raise RuntimeError(msg)
+
     def _get_token_usage(self, response: AIMessage) -> UsageMetadata:
         """Extract token usage from an AIMessage, checking both LangChain and OpenAI formats.
 
@@ -195,20 +228,19 @@ class ToolCallAgentGraph(DualNodeAgent):
         finish_reason: str | None = metadata.get("finish_reason")
 
         # Output truncated — can cause GraphRecursionError loop if unhandled
-        if finish_reason == LLMFinishReason.LENGTH:
+        truncation: str | None = _truncation_reason(response)
+        if truncation is not None:
             if self._max_truncation_retries > 0:
                 response = await self._retry_on_truncation(response, state)
+                # A retry can come back cut off as well; the loop has to end here rather than run the tool.
+                truncation = _truncation_reason(response)
+                if truncation is None:
+                    metadata = getattr(response, "response_metadata", {})
+                    finish_reason = metadata.get("finish_reason")
+                else:
+                    self._raise_truncated(response, metadata, truncation)
             else:
-                usage: UsageMetadata = self._get_token_usage(response)
-                truncated_content: str = str(response.content)[:500] if response.content else "<empty>"
-                model_name: str = metadata.get("model_name", "unknown")
-                msg: str = (f"LLM output truncated (finish_reason='length'). "
-                            f"model={model_name}, "
-                            f"output_tokens={usage['output_tokens']}, "
-                            f"input_tokens={usage['input_tokens']}, "
-                            f"total_tokens={usage['total_tokens']}. "
-                            f"Truncated output: {truncated_content!r}")
-                raise RuntimeError(msg)
+                self._raise_truncated(response, metadata, truncation)
 
         # Empty response — no content, no tool calls at all
         if (not response.tool_calls and not getattr(response, "invalid_tool_calls", None)

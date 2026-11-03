@@ -16,12 +16,14 @@
 import datetime
 import json
 import logging
+import types
 import typing
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessageChunk
 from langchain_core.messages import HumanMessage
 from langchain_core.messages import ToolMessage
 from langgraph.graph.state import CompiledStateGraph
@@ -32,7 +34,10 @@ from nat.data_models.api_server import ChatResponseChunkChoice
 from nat.data_models.api_server import ChoiceDelta
 from nat.data_models.api_server import ChoiceDeltaToolCall
 from nat.data_models.api_server import ChoiceDeltaToolCallFunction
+from nat.plugins.langchain.agent.base import TRUNCATED_TOOL_CALL_ARGS
 from nat.plugins.langchain.agent.base import AgentDecision
+from nat.plugins.langchain.agent.base import _chunk_to_message
+from nat.plugins.langchain.agent.base import _incomplete_tool_call_args
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraph
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraphState
 from nat.plugins.langchain.agent.tool_calling_agent.agent import create_tool_calling_agent_prompt
@@ -556,6 +561,80 @@ async def test_validate_truncation_delegates_to_retry(error_mock_llm, mock_tool)
 
     mock_retry.assert_awaited_once()
     assert result.content == "complete"
+
+
+def _cut_off_chunk(raw_args: str = '{"path": "report.txt", "content": "line 01') -> AIMessageChunk:
+    """The reply ``_stream_llm`` accumulates when the stream ends in the middle of the arguments."""
+    return AIMessageChunk(content="",
+                          tool_call_chunks=[{
+                              "name": "T", "args": raw_args, "id": "call_1", "index": 0
+                          }])
+
+
+def test_chunk_to_message_records_cut_off_arguments():
+    """The conversion records which tool call could not be trusted, and does not raise."""
+    message = _chunk_to_message(_cut_off_chunk())
+
+    assert message.response_metadata[TRUNCATED_TOOL_CALL_ARGS] == ["T"]
+
+
+@pytest.mark.parametrize("raw_args", ['{"path": "report.txt"}', "", "{}"], ids=["complete", "empty", "empty_object"])
+def test_chunk_to_message_leaves_complete_arguments_alone(raw_args):
+    """A complete call, a zero-argument call and an already-parsed call are not reported."""
+    message = _chunk_to_message(_cut_off_chunk(raw_args))
+
+    assert TRUNCATED_TOOL_CALL_ARGS not in message.response_metadata
+
+
+def test_incomplete_tool_call_args_skips_parsed_arguments():
+    """Arguments that are no longer a string cannot be judged, so they are skipped rather than rejected.
+
+    ``ToolCallChunk`` types ``args`` as a string, but providers and middleware in the wild hand over already
+    parsed values; the predicate has to survive that instead of raising inside a conversion.
+    """
+    chunk = types.SimpleNamespace(tool_call_chunks=[{
+        "name": "T", "args": {
+            "path": "report.txt"
+        }, "id": "call_1", "index": 0
+    }, {
+        "name": "U", "args": None, "id": "call_2", "index": 1
+    }])
+
+    assert _incomplete_tool_call_args(chunk) == []
+
+
+async def test_validate_cut_off_tool_call_raises(error_mock_llm, mock_tool):
+    """Cut-off arguments are refused even when the provider reports no finish_reason at all."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=0)
+    response = _chunk_to_message(_cut_off_chunk())
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with pytest.raises(RuntimeError, match="tool call arguments are not complete JSON"):
+        await agent._validate_llm_response(response, state)
+
+
+async def test_validate_complete_tool_call_without_finish_reason_passes(error_mock_llm, mock_tool):
+    """A complete call from a server that omits finish_reason runs as before."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=0, max_empty_response_retries=0)
+    response = _chunk_to_message(_cut_off_chunk('{"path": "report.txt", "content": "done"}'))
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    result = await agent._validate_llm_response(response, state)
+
+    assert result.tool_calls[0]["name"] == "T"
+    assert result.tool_calls[0]["args"] == {"path": "report.txt", "content": "done"}
+
+
+async def test_validate_raises_when_the_truncation_retry_is_cut_off_again(error_mock_llm, mock_tool):
+    """empty/first reply → retry → still cut off: the second reply must not reach the tools either."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=1)
+    truncated = AIMessage(content="partial", response_metadata={"finish_reason": "length"})
+    still_cut_off = _chunk_to_message(_cut_off_chunk())
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_retry_on_truncation", new_callable=AsyncMock, return_value=still_cut_off):
+        with pytest.raises(RuntimeError, match="tool call arguments are not complete JSON"):
+            await agent._validate_llm_response(truncated, state)
 
 
 async def test_validate_empty_response_raises_when_disabled(error_mock_llm, mock_tool):
