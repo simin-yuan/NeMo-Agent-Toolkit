@@ -344,6 +344,18 @@ class _NodeASTVisitor(ast.NodeVisitor):
         self._check_state_passed_to_call(node)
         self.generic_visit(node)
 
+    @staticmethod
+    def _dict_literal_keys(node: ast.expr) -> list[str] | None:
+        """String keys of a dict literal, or ``None`` when they are not statically known."""
+        if not isinstance(node, ast.Dict):
+            return None
+        keys: list[str] = []
+        for key in node.keys:
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                return None
+            keys.append(key.value)
+        return keys
+
     def _record_state_method_call(self, node: ast.Call, obj: str, method: str) -> None:
         """Record a mutating method called on the state object itself, e.g. ``state.update({...})``
         or ``state.pop("key")``. Keys that cannot be named make the analysis partial."""
@@ -443,6 +455,18 @@ class _NodeASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign):  # pylint: disable=invalid-name
+        # ``state |= {...}`` merges the right-hand side into the state in place, which is
+        # the same effect as ``state.update({...})`` for dependency purposes.
+        if not isinstance(node.target, (ast.Subscript, ast.Attribute)):
+            state_obj = self._get_obj_for_node(node.target)
+            if state_obj is not None and isinstance(node.op, ast.BitOr):
+                keys = self._dict_literal_keys(node.value)
+                if keys:
+                    for key in keys:
+                        self.mutations.add(state_obj, key)
+                else:
+                    self.has_dynamic_keys = True
+                    self.warnings.append("state |= ... with keys that are not statically known")
         if isinstance(node.target, (ast.Subscript, ast.Attribute)):
             obj, path = self._extract_nested_path(node.target)
             if obj and path:

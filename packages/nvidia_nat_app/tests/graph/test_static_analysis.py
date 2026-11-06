@@ -579,3 +579,28 @@ class TestChainedSubscript:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestStateMergeInPlace:
+    """``state |= {...}`` mutates the state like ``state.update({...})`` (#2579)."""
+
+    def test_merge_dict_literal_records_the_keys(self):
+
+        def fn(state):
+            state |= {"a": 1, "b": 2}
+            return {}
+
+        r = analyze_function_ast(fn)
+        assert r.mutations.all_fields_flat == {"a", "b"}
+        assert not r.has_dynamic_keys
+
+    def test_merge_variable_is_dynamic(self):
+
+        def fn(state):
+            extra = {"a": 1}
+            state |= extra
+            return {}
+
+        r = analyze_function_ast(fn)
+        assert r.has_dynamic_keys
+        assert any("state |=" in w for w in r.warnings)
